@@ -196,7 +196,7 @@ def revoke_license():
     admin_secret = data.get('admin_secret', '')
     
     # Simple admin authentication (you should set this as an environment variable)
-    ADMIN_SECRET = os.getenv('ADMIN_SECRET', 'change_this_secret_key')
+    ADMIN_SECRET = os.getenv('ADMIN_SECRET', 'Daniel2011.1')
     
     if admin_secret != ADMIN_SECRET:
         return jsonify({"success": False, "error": "Unauthorized"}), 401
