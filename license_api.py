@@ -91,6 +91,42 @@ def validate():
 
     return jsonify({"valid": True, "message": "License valid"}), 200
 
+@app.route('/api/claim', methods=['POST'])
+def claim():
+    """Claim a license in Discord (without HWID) - NEW ENDPOINT FOR DISCORD BOT"""
+    data = request.json
+    license_key = data.get('license_key', '').upper().strip()
+    discord_id = data.get('discord_id', '').strip()
+    
+    if not license_key or not discord_id:
+        return jsonify({"success": False, "error": "Missing license_key or discord_id"}), 400
+    
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT * FROM licenses WHERE license_key = ?", (license_key,))
+    row = c.fetchone()
+    
+    if not row:
+        conn.close()
+        return jsonify({"success": False, "error": "License not found"}), 404
+    
+    if row['revoked']:
+        conn.close()
+        return jsonify({"success": False, "error": "License revoked"}), 403
+    
+    # Check if already claimed by someone else
+    if row['discord_id'] and row['discord_id'] != discord_id:
+        conn.close()
+        return jsonify({"success": False, "error": "License already claimed by another user"}), 403
+    
+    # Update discord_id if not set
+    if not row['discord_id']:
+        c.execute("UPDATE licenses SET discord_id=? WHERE license_key=?", (discord_id, license_key))
+        conn.commit()
+    
+    conn.close()
+    return jsonify({"success": True, "message": "License claimed successfully"}), 200
+
 @app.route('/api/redeem', methods=['POST'])
 def redeem():
     """Activates a license by binding it to a HWID"""
@@ -210,6 +246,47 @@ def hwid_reset():
     conn.close()
 
     return jsonify({"success": True, "message": "HWID reset successfully"}), 200
+
+@app.route('/api/check-share', methods=['POST'])
+def check_share():
+    """Check if a license is being shared across multiple devices"""
+    data = request.json
+    secret = data.get('admin_secret', '')
+    license_key = data.get('license_key', '').upper()
+
+    if not admin_auth(secret):
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+
+    conn = get_db()
+    c = conn.cursor()
+    
+    # Get unique HWIDs
+    c.execute("SELECT DISTINCT hwid FROM access_logs WHERE license_key=? AND hwid IS NOT NULL", (license_key,))
+    hwids = [row['hwid'] for row in c.fetchall()]
+    
+    # Get unique IPs
+    c.execute("SELECT DISTINCT ip_address FROM access_logs WHERE license_key=?", (license_key,))
+    ips = [row['ip_address'] for row in c.fetchall()]
+    
+    conn.close()
+    
+    hwid_count = len(hwids)
+    ip_count = len(ips)
+    
+    if hwid_count >= 3:
+        status = "🚨 High Risk - Likely Shared"
+    elif hwid_count >= 2:
+        status = "⚠️ Suspicious - Multiple Devices"
+    else:
+        status = "✅ Normal Usage"
+    
+    return jsonify({
+        "success": True,
+        "status": status,
+        "unique_hwids": hwid_count,
+        "unique_ips": ip_count,
+        "hwids": hwids
+    }), 200
 
 # ================================
 # RUN SERVER
