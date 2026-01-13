@@ -1,475 +1,193 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import sqlite3
-import hashlib
-import secrets
 from datetime import datetime
 import os
 
 app = Flask(__name__)
-CORS(app)  # Allow requests from Minecraft client
+CORS(app)  # Allow MC client requests
 
-# Database setup
 DATABASE = 'licenses.db'
 
-def init_db():
-    """Initialize the database with required tables"""
-    conn = sqlite3.connect(DATABASE)
-    c = conn.cursor()
-    
-    # Licenses table
-    c.execute('''CREATE TABLE IF NOT EXISTS licenses
-                 (license_key TEXT PRIMARY KEY,
-                  hwid TEXT,
-                  discord_id TEXT,
-                  revoked INTEGER DEFAULT 0,
-                  hwid_resets INTEGER DEFAULT 1,
-                  created_at TEXT,
-                  activated_at TEXT)''')
-    
-    # Access logs table (for anti-sharing detection)
-    c.execute('''CREATE TABLE IF NOT EXISTS access_logs
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  license_key TEXT,
-                  hwid TEXT,
-                  ip_address TEXT,
-                  timestamp TEXT,
-                  FOREIGN KEY (license_key) REFERENCES licenses(license_key))''')
-    
-    conn.commit()
-    conn.close()
-
-# Initialize DB on startup
-init_db()
-
-# ============================================
-# HELPER FUNCTIONS
-# ============================================
+# ================================
+# DATABASE HELPERS
+# ================================
 
 def get_db():
-    """Get database connection"""
     conn = sqlite3.connect(DATABASE)
     conn.row_factory = sqlite3.Row
     return conn
 
-def generate_license_key():
-    """Generate a license key in format: ASTRALUX-XXXX-XXXX-XXXX"""
-    part1 = secrets.token_hex(2).upper()
-    part2 = secrets.token_hex(2).upper()
-    part3 = secrets.token_hex(2).upper()
-    return f"ASTRALUX-{part1}-{part2}-{part3}"
-
-def log_access(license_key, hwid, ip_address):
-    """Log access attempt for anti-sharing detection"""
+def init_db():
     conn = get_db()
     c = conn.cursor()
-    timestamp = datetime.now().isoformat()
-    c.execute("INSERT INTO access_logs (license_key, hwid, ip_address, timestamp) VALUES (?, ?, ?, ?)",
-              (license_key, hwid, ip_address, timestamp))
+    c.execute('''CREATE TABLE IF NOT EXISTS licenses (
+                    license_key TEXT PRIMARY KEY,
+                    hwid TEXT,
+                    discord_id TEXT,
+                    revoked INTEGER DEFAULT 0,
+                    hwid_resets INTEGER DEFAULT 1,
+                    created_at TEXT,
+                    activated_at TEXT
+                )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS access_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    license_key TEXT,
+                    hwid TEXT,
+                    ip_address TEXT,
+                    timestamp TEXT,
+                    FOREIGN KEY (license_key) REFERENCES licenses(license_key)
+                )''')
     conn.commit()
     conn.close()
 
-def check_sharing(license_key):
-    """Check if license is being shared (multiple HWIDs)"""
+def log_access(license_key, hwid, ip):
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT DISTINCT hwid FROM access_logs WHERE license_key = ?", (license_key,))
-    hwids = c.fetchall()
+    c.execute("INSERT INTO access_logs (license_key, hwid, ip_address, timestamp) VALUES (?, ?, ?, ?)",
+              (license_key, hwid, ip, datetime.now().isoformat()))
+    conn.commit()
     conn.close()
-    return len(hwids)
 
-# ============================================
-# API ENDPOINTS
-# ============================================
+init_db()
+
+# ================================
+# PUBLIC ENDPOINTS (MC CLIENT)
+# ================================
 
 @app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    return jsonify({"status": "online", "service": "Astralux License API"}), 200
-
-@app.route('/api/redeem', methods=['POST'])
-def redeem_license():
-    """
-    Redeem a license key (called by Discord bot)
-    Expects: {license_key: str, discord_id: str}
-    """
-    data = request.json
-    license_key = data.get('license_key', '').strip().upper()
-    discord_id = data.get('discord_id', '').strip()
-    
-    if not license_key or not discord_id:
-        return jsonify({"success": False, "error": "Missing license_key or discord_id"}), 400
-    
-    conn = get_db()
-    c = conn.cursor()
-    
-    # Check if license exists
-    c.execute("SELECT * FROM licenses WHERE license_key = ?", (license_key,))
-    license_data = c.fetchone()
-    
-    if license_data:
-        # License already exists
-        if license_data['discord_id']:
-            conn.close()
-            return jsonify({"success": False, "error": "License already redeemed"}), 400
-        
-        # Update with discord_id
-        c.execute("UPDATE licenses SET discord_id = ?, activated_at = ? WHERE license_key = ?",
-                  (discord_id, datetime.now().isoformat(), license_key))
-    else:
-        # Create new license (for sell.app generated keys)
-        c.execute("INSERT INTO licenses (license_key, discord_id, created_at, activated_at) VALUES (?, ?, ?, ?)",
-                  (license_key, discord_id, datetime.now().isoformat(), datetime.now().isoformat()))
-    
-    conn.commit()
-    conn.close()
-    
-    return jsonify({"success": True, "message": "License redeemed successfully"}), 200
+def health():
+    return jsonify({"status": "online"}), 200
 
 @app.route('/api/validate', methods=['POST'])
-def validate_license():
+def validate():
     """
-    Validate a license (called by Minecraft client)
-    Expects: {license_key: str, hwid: str}
+    Called by Minecraft client ONLY.
+    Expects JSON: { "license_key": str, "hwid": str }
     """
     data = request.json
-    license_key = data.get('license_key', '').strip().upper()
+    license_key = data.get('license_key', '').upper().strip()
     hwid = data.get('hwid', '').strip()
-    ip_address = request.remote_addr
-    
+    ip = request.remote_addr
+
     if not license_key or not hwid:
         return jsonify({"valid": False, "error": "Missing license_key or hwid"}), 400
-    
+
     conn = get_db()
     c = conn.cursor()
-    
-    # Get license data
     c.execute("SELECT * FROM licenses WHERE license_key = ?", (license_key,))
-    license_data = c.fetchone()
-    
-    if not license_data:
+    row = c.fetchone()
+
+    if not row:
         conn.close()
         return jsonify({"valid": False, "error": "License not found"}), 404
-    
-    # Check if revoked
-    if license_data['revoked'] == 1:
+
+    if row['revoked']:
         conn.close()
-        return jsonify({"valid": False, "error": "License has been revoked"}), 403
-    
-    # Check if license is redeemed in Discord
-    if not license_data['discord_id']:
+        return jsonify({"valid": False, "error": "License revoked"}), 403
+
+    if not row['discord_id']:
         conn.close()
         return jsonify({"valid": False, "error": "License not activated. Redeem in Discord first."}), 403
-    
-    # HWID binding logic
-    stored_hwid = license_data['hwid']
-    
+
+    stored_hwid = row['hwid']
     if not stored_hwid:
-        # First time binding HWID
-        c.execute("UPDATE licenses SET hwid = ? WHERE license_key = ?", (hwid, license_key))
+        c.execute("UPDATE licenses SET hwid=? WHERE license_key=?", (hwid, license_key))
         conn.commit()
-        log_access(license_key, hwid, ip_address)
+        log_access(license_key, hwid, ip)
         conn.close()
         return jsonify({"valid": True, "message": "HWID bound successfully"}), 200
-    
+
     elif stored_hwid == hwid:
-        # HWID matches - allow access
-        log_access(license_key, hwid, ip_address)
+        log_access(license_key, hwid, ip)
         conn.close()
         return jsonify({"valid": True, "message": "License valid"}), 200
-    
+
     else:
-        # HWID mismatch - potential sharing
-        log_access(license_key, hwid, ip_address)
+        log_access(license_key, hwid, ip)
         conn.close()
-        return jsonify({"valid": False, "error": "HWID mismatch. License is bound to another PC."}), 403
+        return jsonify({"valid": False, "error": "HWID mismatch. License bound to another PC."}), 403
 
-@app.route('/api/revoke', methods=['POST'])
-def revoke_license():
-    """
-    Revoke a license (admin only - called by Discord bot)
-    Expects: {license_key: str, admin_secret: str}
-    """
-    data = request.json
-    license_key = data.get('license_key', '').strip().upper()
-    admin_secret = data.get('admin_secret', '')
-    
-    ADMIN_SECRET = os.getenv('ADMIN_SECRET', 'Qrynt10')
-    
-    if admin_secret != ADMIN_SECRET:
-        return jsonify({"success": False, "error": "Unauthorized"}), 401
-    
-    if not license_key:
-        return jsonify({"success": False, "error": "Missing license_key"}), 400
-    
-    conn = get_db()
-    c = conn.cursor()
-    
-    c.execute("UPDATE licenses SET revoked = 1 WHERE license_key = ?", (license_key,))
-    
-    if c.rowcount == 0:
-        conn.close()
-        return jsonify({"success": False, "error": "License not found"}), 404
-    
-    conn.commit()
-    conn.close()
-    
-    return jsonify({"success": True, "message": "License revoked"}), 200
+# ================================
+# ADMIN ENDPOINTS (Discord Bot Only)
+# ================================
 
-@app.route('/api/hwid-reset', methods=['POST'])
-def hwid_reset():
-    """
-    Reset HWID for a license (admin only)
-    Expects: {license_key: str, admin_secret: str}
-    """
-    data = request.json
-    license_key = data.get('license_key', '').strip().upper()
-    admin_secret = data.get('admin_secret', '')
-    
-    ADMIN_SECRET = os.getenv('ADMIN_SECRET', 'Qrynt10')
-    
-    if admin_secret != ADMIN_SECRET:
-        return jsonify({"success": False, "error": "Unauthorized"}), 401
-    
-    if not license_key:
-        return jsonify({"success": False, "error": "Missing license_key"}), 400
-    
-    conn = get_db()
-    c = conn.cursor()
-    
-    # Check if license exists and has resets available
-    c.execute("SELECT hwid_resets FROM licenses WHERE license_key = ?", (license_key,))
-    result = c.fetchone()
-    
-    if not result:
-        conn.close()
-        return jsonify({"success": False, "error": "License not found"}), 404
-    
-    if result['hwid_resets'] <= 0:
-        conn.close()
-        return jsonify({"success": False, "error": "No HWID resets remaining"}), 403
-    
-    # Reset HWID and decrement reset counter
-    c.execute("UPDATE licenses SET hwid = NULL, hwid_resets = hwid_resets - 1 WHERE license_key = ?",
-              (license_key,))
-    conn.commit()
-    conn.close()
-    
-    return jsonify({"success": True, "message": "HWID reset successfully"}), 200
+ADMIN_SECRET = os.getenv('ADMIN_SECRET', 'Qrynt10')
 
-@app.route('/api/check-share', methods=['POST'])
-def check_share():
-    """
-    Check if license is being shared (admin only)
-    Expects: {license_key: str, admin_secret: str}
-    """
-    data = request.json
-    license_key = data.get('license_key', '').strip().upper()
-    admin_secret = data.get('admin_secret', '')
-    
-    ADMIN_SECRET = os.getenv('ADMIN_SECRET', 'Qrynt10')
-    
-    if admin_secret != ADMIN_SECRET:
-        return jsonify({"success": False, "error": "Unauthorized"}), 401
-    
-    if not license_key:
-        return jsonify({"success": False, "error": "Missing license_key"}), 400
-    
-    conn = get_db()
-    c = conn.cursor()
-    
-    # Get unique HWIDs
-    c.execute("SELECT DISTINCT hwid FROM access_logs WHERE license_key = ?", (license_key,))
-    hwids = [row['hwid'] for row in c.fetchall()]
-    
-    # Get unique IPs
-    c.execute("SELECT DISTINCT ip_address FROM access_logs WHERE license_key = ?", (license_key,))
-    ips = [row['ip_address'] for row in c.fetchall()]
-    
-    conn.close()
-    
-    hwid_count = len(hwids)
-    ip_count = len(ips)
-    
-    status = "OK"
-    if hwid_count >= 2:
-        status = "⚠️ SHARING DETECTED"
-    elif hwid_count >= 3:
-        status = "🚨 AUTO-REVOKE RECOMMENDED"
-    
-    return jsonify({
-        "success": True,
-        "license_key": license_key,
-        "unique_hwids": hwid_count,
-        "unique_ips": ip_count,
-        "status": status,
-        "hwids": hwids,
-        "ips": ips
-    }), 200
+def admin_auth(secret):
+    return secret == ADMIN_SECRET
 
 @app.route('/api/generate', methods=['POST'])
-def generate_license():
-    """
-    Generate a new license (admin only - for Discord bot)
-    Expects: {admin_secret: str, discord_id: str (optional)}
-    """
+def generate():
     data = request.json
-    admin_secret = data.get('admin_secret', '')
+    secret = data.get('admin_secret', '')
     discord_id = data.get('discord_id', '')
-    
-    ADMIN_SECRET = os.getenv('ADMIN_SECRET', 'Qrynt10')
-    
-    if admin_secret != ADMIN_SECRET:
+
+    if not admin_auth(secret):
         return jsonify({"success": False, "error": "Unauthorized"}), 401
-    
-    license_key = generate_license_key()
-    
+
+    import secrets
+    license_key = f"ASTRALUX-{secrets.token_hex(2).upper()}-{secrets.token_hex(2).upper()}-{secrets.token_hex(2).upper()}"
+
     conn = get_db()
     c = conn.cursor()
-    
     c.execute("INSERT INTO licenses (license_key, discord_id, created_at) VALUES (?, ?, ?)",
               (license_key, discord_id if discord_id else None, datetime.now().isoformat()))
     conn.commit()
     conn.close()
-    
+
     return jsonify({"success": True, "license_key": license_key}), 200
 
-@app.route('/api/reset-hwid', methods=['POST'])
-def reset_hwid_flexible():
-    """
-    Reset HWID for a license (admin only) - accepts multiple identifier types
-    Expects: {identifier: str, admin_secret: str}
-    identifier can be: license_key or discord_id
-    """
+@app.route('/api/revoke', methods=['POST'])
+def revoke():
     data = request.json
-    identifier = data.get('identifier', '').strip()
-    admin_secret = data.get('admin_secret', '')
-    
-    ADMIN_SECRET = os.getenv('ADMIN_SECRET', 'Qrynt10')
-    
-    if admin_secret != ADMIN_SECRET:
+    secret = data.get('admin_secret', '')
+    license_key = data.get('license_key', '').upper()
+
+    if not admin_auth(secret):
         return jsonify({"success": False, "error": "Unauthorized"}), 401
-    
-    if not identifier:
-        return jsonify({"success": False, "error": "Missing identifier"}), 400
-    
+
     conn = get_db()
     c = conn.cursor()
-    
-    # Try to find license by multiple methods
-    identifier_upper = identifier.upper()
-    c.execute("""
-        SELECT license_key, hwid, discord_id, hwid_resets 
-        FROM licenses 
-        WHERE license_key = ? OR discord_id = ?
-    """, (identifier_upper, identifier))
-    
-    result = c.fetchone()
-    
-    if not result:
-        conn.close()
-        return jsonify({"success": False, "error": "License not found"}), 404
-    
-    license_key = result['license_key']
-    old_hwid = result['hwid']
-    discord_id = result['discord_id']
-    hwid_resets = result['hwid_resets']
-    
-    if hwid_resets <= 0:
-        conn.close()
-        return jsonify({"success": False, "error": "No HWID resets remaining"}), 403
-    
-    # Reset HWID and decrement reset counter
-    c.execute("""
-        UPDATE licenses 
-        SET hwid = NULL, hwid_resets = hwid_resets - 1 
-        WHERE license_key = ?
-    """, (license_key,))
-    
+    c.execute("UPDATE licenses SET revoked=1 WHERE license_key=?", (license_key,))
     conn.commit()
     conn.close()
-    
-    return jsonify({
-        "success": True,
-        "license_key": license_key,
-        "old_hwid": old_hwid,
-        "discord_id": discord_id,
-        "resets_remaining": hwid_resets - 1,
-        "message": "HWID reset successfully"
-    }), 200
 
+    return jsonify({"success": True, "message": "License revoked"}), 200
 
-@app.route('/api/license-info', methods=['POST'])
-def license_info():
-    """
-    Get license information (admin only)
-    Expects: {identifier: str, admin_secret: str}
-    identifier can be: license_key or discord_id
-    """
+@app.route('/api/hwid-reset', methods=['POST'])
+def hwid_reset():
     data = request.json
-    identifier = data.get('identifier', '').strip()
-    admin_secret = data.get('admin_secret', '')
-    
-    ADMIN_SECRET = os.getenv('ADMIN_SECRET', 'Qrynt10')
-    
-    if admin_secret != ADMIN_SECRET:
+    secret = data.get('admin_secret', '')
+    license_key = data.get('license_key', '').upper()
+
+    if not admin_auth(secret):
         return jsonify({"success": False, "error": "Unauthorized"}), 401
-    
-    if not identifier:
-        return jsonify({"success": False, "error": "Missing identifier"}), 400
-    
+
     conn = get_db()
     c = conn.cursor()
-    
-    # Find license
-    identifier_upper = identifier.upper()
-    c.execute("""
-        SELECT license_key, hwid, discord_id, revoked, hwid_resets, created_at, activated_at
-        FROM licenses 
-        WHERE license_key = ? OR discord_id = ?
-    """, (identifier_upper, identifier))
-    
-    result = c.fetchone()
-    
-    if not result:
+    c.execute("SELECT hwid_resets FROM licenses WHERE license_key=?", (license_key,))
+    row = c.fetchone()
+
+    if not row:
         conn.close()
         return jsonify({"success": False, "error": "License not found"}), 404
-    
-    # Get access log stats
-    c.execute("""
-        SELECT COUNT(DISTINCT hwid) as unique_hwids, 
-               COUNT(DISTINCT ip_address) as unique_ips,
-               COUNT(*) as total_accesses
-        FROM access_logs 
-        WHERE license_key = ?
-    """, (result['license_key'],))
-    
-    stats = c.fetchone()
-    conn.close()
-    
-    return jsonify({
-        "success": True,
-        "license_key": result['license_key'],
-        "hwid": result['hwid'],
-        "discord_id": result['discord_id'],
-        "revoked": bool(result['revoked']),
-        "hwid_resets": result['hwid_resets'],
-        "created_at": result['created_at'],
-        "activated_at": result['activated_at'],
-        "stats": {
-            "unique_hwids": stats['unique_hwids'] if stats else 0,
-            "unique_ips": stats['unique_ips'] if stats else 0,
-            "total_accesses": stats['total_accesses'] if stats else 0
-        }
-    }), 200
 
-# ============================================
+    if row['hwid_resets'] <= 0:
+        conn.close()
+        return jsonify({"success": False, "error": "No HWID resets remaining"}), 403
+
+    c.execute("UPDATE licenses SET hwid=NULL, hwid_resets=hwid_resets-1 WHERE license_key=?", (license_key,))
+    conn.commit()
+    conn.close()
+
+    return jsonify({"success": True, "message": "HWID reset successfully"}), 200
+
+# ================================
 # RUN SERVER
-# ============================================
+# ================================
 
 if __name__ == '__main__':
-    print("🚀 Astralux License API Starting...")
-    print("📦 Database initialized")
-    print("🔒 Admin endpoints protected")
+    print("🚀 Astralux License API running...")
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
