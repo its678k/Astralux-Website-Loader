@@ -61,6 +61,10 @@ def health():
 
 @app.route('/api/validate', methods=['POST'])
 def validate():
+    """
+    Called by Minecraft client ONLY.
+    Expects JSON: { "license_key": str, "hwid": str }
+    """
     data = request.json
     license_key = data.get('license_key', '').upper().strip()
     hwid = data.get('hwid', '').strip()
@@ -105,7 +109,7 @@ def validate():
         return jsonify({"valid": False, "error": "HWID mismatch. License bound to another PC."}), 403
 
 # ================================
-# ADMIN ENDPOINTS
+# ADMIN ENDPOINTS (Discord Bot Only)
 # ================================
 
 ADMIN_SECRET = os.getenv('ADMIN_SECRET', 'Qrynt10')
@@ -184,6 +188,6 @@ def hwid_reset():
 # ================================
 
 if __name__ == '__main__':
-    print("🚀 Astralux License API running with SQLite...")
+    print("🚀 Astralux License API running...")
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
