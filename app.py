@@ -10,219 +10,151 @@ app = Flask(__name__)
 CORS(app)
 
 DATABASE = 'licenses.db'
+ADMIN_SECRET = os.getenv("ADMIN_SECRET", "Qrynt10")
+
+# ... (keep your existing Discord OAuth and other code) ...
 
 # ======================
-# DISCORD CONFIG
+# ADD THIS NEW ENDPOINT
 # ======================
 
-DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
-DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
-DISCORD_REDIRECT_URI = "http://localhost:5000/api/discord/callback"
-
-DISCORD_GUILD_ID = "YOUR_GUILD_ID"
-REQUIRED_ROLE_ID = "YOUR_ROLE_ID"
-BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-
-# ======================
-# DATABASE
-# ======================
-
-def get_db():
-    conn = sqlite3.connect(DATABASE)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def init_db():
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS licenses (
-            license_key TEXT PRIMARY KEY,
-            hwid TEXT,
-            discord_id TEXT,
-            revoked INTEGER DEFAULT 0,
-            hwid_resets INTEGER DEFAULT 1,
-            created_at TEXT,
-            activated_at TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-init_db()
-
-# ======================
-# UTILS
-# ======================
-
-def log_access(license_key, hwid, ip):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO access_logs (license_key, hwid, ip_address, timestamp)
-        VALUES (?, ?, ?, ?)
-    """, (license_key, hwid, ip, datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
-
-# ======================
-# HEALTH
-# ======================
-
-@app.route('/health')
-def health():
-    return jsonify({"status": "online"})
-
-# ======================
-# DISCORD OAUTH
-# ======================
-
-@app.route('/api/discord/login')
-def discord_login():
-    state = secrets.token_urlsafe(16)
-
-    url = (
-        "https://discord.com/api/oauth2/authorize"
-        f"?client_id={DISCORD_CLIENT_ID}"
-        "&response_type=code"
-        "&scope=identify"
-        f"&redirect_uri={DISCORD_REDIRECT_URI}"
-        f"&state={state}"
-    )
-
-    return jsonify({"url": url})
-
-@app.route('/api/discord/callback')
-def discord_callback():
-    code = request.args.get("code")
-    if not code:
-        return "Missing code", 400
-
-    token = requests.post(
-        "https://discord.com/api/oauth2/token",
-        data={
-            "client_id": DISCORD_CLIENT_ID,
-            "client_secret": DISCORD_CLIENT_SECRET,
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": DISCORD_REDIRECT_URI
-        },
-        headers={"Content-Type": "application/x-www-form-urlencoded"}
-    ).json()
-
-    access_token = token.get("access_token")
-    if not access_token:
-        return "OAuth failed", 401
-
-    user = requests.get(
-        "https://discord.com/api/users/@me",
-        headers={"Authorization": f"Bearer {access_token}"}
-    ).json()
-
-    discord_id = user["id"]
-
-    member = requests.get(
-        f"https://discord.com/api/guilds/{DISCORD_GUILD_ID}/members/{discord_id}",
-        headers={"Authorization": f"Bot {BOT_TOKEN}"}
-    )
-
-    if member.status_code != 200:
-        return "Join the Discord server first", 403
-
-    roles = member.json().get("roles", [])
-    if REQUIRED_ROLE_ID not in roles:
-        return "Missing required role", 403
-
-    return f"""
-    <html>
-    <body style="font-family:sans-serif;text-align:center">
-        <h2>✅ Discord Linked</h2>
-        <p>You may return to the launcher.</p>
-        <script>
-          window.opener.postMessage({{
-            discord_id: "{discord_id}"
-          }}, "*");
-          window.close();
-        </script>
-    </body>
-    </html>
-    """
-
-# ======================
-# LICENSE VALIDATION
-# ======================
-
-@app.route('/api/validate', methods=['POST'])
-def validate():
+@app.route('/api/claim', methods=['POST'])
+def claim():
+    """Claim a license in Discord (without HWID)"""
     data = request.json
-    license_key = data.get("license_key", "").upper()
-    hwid = data.get("hwid", "")
-    discord_id = data.get("discord_id", "")
-    ip = request.remote_addr
-
-    if not license_key or not hwid or not discord_id:
-        return jsonify({"valid": False, "error": "Missing data"}), 400
-
+    license_key = data.get('license_key', '').upper().strip()
+    discord_id = data.get('discord_id', '').strip()
+    
+    if not license_key or not discord_id:
+        return jsonify({"success": False, "error": "Missing license_key or discord_id"}), 400
+    
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT * FROM licenses WHERE license_key=?", (license_key,))
+    c.execute("SELECT * FROM licenses WHERE license_key = ?", (license_key,))
     row = c.fetchone()
-
+    
     if not row:
-        return jsonify({"valid": False, "error": "Invalid license"}), 404
-
-    if row["revoked"]:
-        return jsonify({"valid": False, "error": "License revoked"}), 403
-
-    if row["discord_id"] and row["discord_id"] != discord_id:
-        return jsonify({"valid": False, "error": "License bound to another Discord"}), 403
-
-    if not row["discord_id"]:
-        c.execute(
-            "UPDATE licenses SET discord_id=?, activated_at=? WHERE license_key=?",
-            (discord_id, datetime.now().isoformat(), license_key)
-        )
+        conn.close()
+        return jsonify({"success": False, "error": "License not found"}), 404
+    
+    if row['revoked']:
+        conn.close()
+        return jsonify({"success": False, "error": "License revoked"}), 403
+    
+    # Check if already claimed by someone else
+    if row['discord_id'] and row['discord_id'] != discord_id:
+        conn.close()
+        return jsonify({"success": False, "error": "License already claimed by another user"}), 403
+    
+    # Update discord_id if not set
+    if not row['discord_id']:
+        c.execute("UPDATE licenses SET discord_id=? WHERE license_key=?", (discord_id, license_key))
         conn.commit()
-
-    if not row["hwid"]:
-        c.execute("UPDATE licenses SET hwid=? WHERE license_key=?", (hwid, license_key))
-        conn.commit()
-        return jsonify({"valid": True, "message": "HWID bound"})
-
-    if row["hwid"] != hwid:
-        return jsonify({"valid": False, "error": "HWID mismatch"}), 403
-
-    return jsonify({"valid": True, "message": "License valid"})
+    
+    conn.close()
+    return jsonify({"success": True, "message": "License claimed successfully"}), 200
 
 # ======================
-# ADMIN
+# UPDATE YOUR GENERATE ENDPOINT
 # ======================
-
-ADMIN_SECRET = os.getenv("ADMIN_SECRET", "CHANGE_ME")
 
 @app.route('/api/generate', methods=['POST'])
 def generate():
     data = request.json
     if data.get("admin_secret") != ADMIN_SECRET:
-        return jsonify({"error": "Unauthorized"}), 401
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
 
-    key = f"ASTRALUX-{secrets.token_hex(2).upper()}-{secrets.token_hex(2).upper()}"
+    discord_id = data.get("discord_id", None)
+    
+    key = f"ASTRALUX-{secrets.token_hex(2).upper()}-{secrets.token_hex(2).upper()}-{secrets.token_hex(2).upper()}"
 
     conn = get_db()
     c = conn.cursor()
     c.execute(
-        "INSERT INTO licenses (license_key, created_at) VALUES (?, ?)",
-        (key, datetime.now().isoformat())
+        "INSERT INTO licenses (license_key, discord_id, created_at) VALUES (?, ?, ?)",
+        (key, discord_id, datetime.now().isoformat())
     )
     conn.commit()
     conn.close()
 
-    return jsonify({"license_key": key})
+    return jsonify({"success": True, "license_key": key})
 
 # ======================
-# RUN
+# ADD REVOKE ENDPOINT
 # ======================
 
-if __name__ == "__main__":
-    print("🚀 Astralux API running")
-    app.run(host="0.0.0.0", port=5000)
+@app.route('/api/revoke', methods=['POST'])
+def revoke():
+    data = request.json
+    if data.get("admin_secret") != ADMIN_SECRET:
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+    
+    license_key = data.get("license_key", "").upper()
+    
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("UPDATE licenses SET revoked=1 WHERE license_key=?", (license_key,))
+    conn.commit()
+    conn.close()
+    
+    return jsonify({"success": True, "message": "License revoked"}), 200
+
+# ======================
+# ADD HWID RESET ENDPOINT
+# ======================
+
+@app.route('/api/hwid-reset', methods=['POST'])
+def hwid_reset():
+    data = request.json
+    if data.get("admin_secret") != ADMIN_SECRET:
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+    
+    license_key = data.get("license_key", "").upper()
+    
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT * FROM licenses WHERE license_key=?", (license_key,))
+    row = c.fetchone()
+    
+    if not row:
+        conn.close()
+        return jsonify({"success": False, "error": "License not found"}), 404
+    
+    if row['hwid_resets'] <= 0:
+        conn.close()
+        return jsonify({"success": False, "error": "No resets remaining"}), 403
+    
+    c.execute("UPDATE licenses SET hwid=NULL, hwid_resets=hwid_resets-1 WHERE license_key=?", (license_key,))
+    conn.commit()
+    conn.close()
+    
+    return jsonify({"success": True, "message": "HWID reset"}), 200
+
+# ======================
+# UPDATE VALIDATE ENDPOINT
+# ======================
+
+@app.route('/api/validate', methods=['POST'])
+def validate():
+    """Check if license is valid (doesn't bind anything)"""
+    data = request.json
+    license_key = data.get("license_key", "").upper()
+    
+    if not license_key:
+        return jsonify({"valid": False, "error": "Missing license_key"}), 400
+    
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT * FROM licenses WHERE license_key=?", (license_key,))
+    row = c.fetchone()
+    
+    if not row:
+        conn.close()
+        return jsonify({"valid": False, "error": "License not found"}), 404
+    
+    if row["revoked"]:
+        conn.close()
+        return jsonify({"valid": False, "error": "License revoked"}), 403
+    
+    conn.close()
+    return jsonify({"valid": True, "message": "License is valid"}), 200
