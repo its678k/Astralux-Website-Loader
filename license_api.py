@@ -226,7 +226,7 @@ def hwid_reset():
     license_key = data.get('license_key', '').strip().upper()
     admin_secret = data.get('admin_secret', '')
     
-    ADMIN_SECRET = os.getenv('ADMIN_SECRET', 'Daniel2011.1')
+    ADMIN_SECRET = os.getenv('ADMIN_SECRET', 'Qrynt10')
     
     if admin_secret != ADMIN_SECRET:
         return jsonify({"success": False, "error": "Unauthorized"}), 401
@@ -267,7 +267,7 @@ def check_share():
     license_key = data.get('license_key', '').strip().upper()
     admin_secret = data.get('admin_secret', '')
     
-    ADMIN_SECRET = os.getenv('ADMIN_SECRET', 'Daniel2011.1')
+    ADMIN_SECRET = os.getenv('ADMIN_SECRET', 'Qrynt10')
     
     if admin_secret != ADMIN_SECRET:
         return jsonify({"success": False, "error": "Unauthorized"}), 401
