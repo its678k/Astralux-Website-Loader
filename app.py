@@ -1,3 +1,4 @@
+# app.py
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import sqlite3
@@ -5,7 +6,7 @@ from datetime import datetime
 import os
 
 app = Flask(__name__)
-CORS(app)  # Allow MC client requests
+CORS(app)
 
 DATABASE = 'licenses.db'
 
@@ -52,7 +53,7 @@ def log_access(license_key, hwid, ip):
 init_db()
 
 # ================================
-# PUBLIC ENDPOINTS (MC CLIENT)
+# PUBLIC ENDPOINTS
 # ================================
 
 @app.route('/health', methods=['GET'])
@@ -81,7 +82,6 @@ def validate():
         conn.close()
         return jsonify({"valid": False, "error": "License revoked"}), 403
 
-    # OPTIONAL: log access without HWID
     c.execute(
         "INSERT INTO access_logs (license_key, hwid, ip_address, timestamp) VALUES (?, ?, ?, ?)",
         (license_key, None, ip, datetime.now().isoformat())
@@ -91,6 +91,7 @@ def validate():
 
     return jsonify({"valid": True, "message": "License valid"}), 200
 
+# ===== ADD THIS NEW ENDPOINT HERE =====
 @app.route('/api/claim', methods=['POST'])
 def claim():
     """Claim a license in Discord (without HWID) - NEW ENDPOINT"""
@@ -126,6 +127,7 @@ def claim():
     
     conn.close()
     return jsonify({"success": True, "message": "License claimed successfully"}), 200
+# ===== END NEW ENDPOINT =====
 
 @app.route('/api/redeem', methods=['POST'])
 def redeem():
@@ -151,19 +153,15 @@ def redeem():
         conn.close()
         return jsonify({"success": False, "error": "License revoked"}), 403
 
-    # If already bound to a HWID
     if row['hwid']:
         if row['hwid'] == hwid:
-            # Same HWID - allow access
             log_access(license_key, hwid, ip)
             conn.close()
             return jsonify({"success": True, "message": "License validated"}), 200
         else:
-            # Different HWID - deny
             conn.close()
             return jsonify({"success": False, "error": "HWID mismatch"}), 403
 
-    # First time activation - bind HWID
     c.execute("UPDATE licenses SET hwid=?, activated_at=? WHERE license_key=?",
               (hwid, datetime.now().isoformat(), license_key))
     conn.commit()
@@ -173,7 +171,7 @@ def redeem():
     return jsonify({"success": True, "message": "License activated"}), 200
 
 # ================================
-# ADMIN ENDPOINTS (Discord Bot Only)
+# ADMIN ENDPOINTS
 # ================================
 
 ADMIN_SECRET = os.getenv('ADMIN_SECRET', 'Qrynt10')
@@ -183,110 +181,10 @@ def admin_auth(secret):
 
 @app.route('/api/generate', methods=['POST'])
 def generate():
-    data = request.json
-    secret = data.get('admin_secret', '')
-    discord_id = data.get('discord_id', '')
+    # ... (rest of your admin endpoints)
+    pass
 
-    if not admin_auth(secret):
-        return jsonify({"success": False, "error": "Unauthorized"}), 401
-
-    import secrets
-    license_key = f"ASTRALUX-{secrets.token_hex(2).upper()}-{secrets.token_hex(2).upper()}-{secrets.token_hex(2).upper()}"
-
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("INSERT INTO licenses (license_key, discord_id, created_at) VALUES (?, ?, ?)",
-              (license_key, discord_id if discord_id else None, datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
-
-    return jsonify({"success": True, "license_key": license_key}), 200
-
-@app.route('/api/revoke', methods=['POST'])
-def revoke():
-    data = request.json
-    secret = data.get('admin_secret', '')
-    license_key = data.get('license_key', '').upper()
-
-    if not admin_auth(secret):
-        return jsonify({"success": False, "error": "Unauthorized"}), 401
-
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("UPDATE licenses SET revoked=1 WHERE license_key=?", (license_key,))
-    conn.commit()
-    conn.close()
-
-    return jsonify({"success": True, "message": "License revoked"}), 200
-
-@app.route('/api/hwid-reset', methods=['POST'])
-def hwid_reset():
-    data = request.json
-    secret = data.get('admin_secret', '')
-    license_key = data.get('license_key', '').upper()
-
-    if not admin_auth(secret):
-        return jsonify({"success": False, "error": "Unauthorized"}), 401
-
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT hwid_resets FROM licenses WHERE license_key=?", (license_key,))
-    row = c.fetchone()
-
-    if not row:
-        conn.close()
-        return jsonify({"success": False, "error": "License not found"}), 404
-
-    if row['hwid_resets'] <= 0:
-        conn.close()
-        return jsonify({"success": False, "error": "No HWID resets remaining"}), 403
-
-    c.execute("UPDATE licenses SET hwid=NULL, hwid_resets=hwid_resets-1 WHERE license_key=?", (license_key,))
-    conn.commit()
-    conn.close()
-
-    return jsonify({"success": True, "message": "HWID reset successfully"}), 200
-
-@app.route('/api/check-share', methods=['POST'])
-def check_share():
-    """Check if a license is being shared across multiple devices"""
-    data = request.json
-    secret = data.get('admin_secret', '')
-    license_key = data.get('license_key', '').upper()
-
-    if not admin_auth(secret):
-        return jsonify({"success": False, "error": "Unauthorized"}), 401
-
-    conn = get_db()
-    c = conn.cursor()
-    
-    # Get unique HWIDs
-    c.execute("SELECT DISTINCT hwid FROM access_logs WHERE license_key=? AND hwid IS NOT NULL", (license_key,))
-    hwids = [row['hwid'] for row in c.fetchall()]
-    
-    # Get unique IPs
-    c.execute("SELECT DISTINCT ip_address FROM access_logs WHERE license_key=?", (license_key,))
-    ips = [row['ip_address'] for row in c.fetchall()]
-    
-    conn.close()
-    
-    hwid_count = len(hwids)
-    ip_count = len(ips)
-    
-    if hwid_count >= 3:
-        status = "🚨 High Risk - Likely Shared"
-    elif hwid_count >= 2:
-        status = "⚠️ Suspicious - Multiple Devices"
-    else:
-        status = "✅ Normal Usage"
-    
-    return jsonify({
-        "success": True,
-        "status": status,
-        "unique_hwids": hwid_count,
-        "unique_ips": ip_count,
-        "hwids": hwids
-    }), 200
+# ... (other admin endpoints: /api/revoke, /api/hwid-reset, /api/check-share)
 
 # ================================
 # RUN SERVER
