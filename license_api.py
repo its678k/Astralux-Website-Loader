@@ -1,164 +1,302 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import sqlite3
 from datetime import datetime
 import os
+import psycopg2
+import psycopg2.extras
+import secrets
 
 app = Flask(__name__)
 CORS(app)
 
-DATABASE = 'licenses.db'
+# ================================
+# CONFIG
+# ================================
+
+DATABASE_URL = os.getenv("DATABASE_URL")  # Railway Postgres
+ADMIN_SECRET = os.getenv("ADMIN_SECRET", "Daniel2011.1")
 
 # ================================
-# DATABASE HELPERS
+# DATABASE
 # ================================
 
 def get_db():
-    conn = sqlite3.connect(DATABASE)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 def init_db():
     conn = get_db()
     c = conn.cursor()
 
-    # HWID columns kept but NOT USED (so no DB break)
-    c.execute('''CREATE TABLE IF NOT EXISTS licenses (
-                    license_key TEXT PRIMARY KEY,
-                    hwid TEXT,
-                    discord_id TEXT,
-                    revoked INTEGER DEFAULT 0,
-                    hwid_resets INTEGER DEFAULT 1,
-                    created_at TEXT,
-                    activated_at TEXT
-                )''')
-
-    c.execute('''CREATE TABLE IF NOT EXISTS access_logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    license_key TEXT,
-                    ip_address TEXT,
-                    timestamp TEXT,
-                    FOREIGN KEY (license_key) REFERENCES licenses(license_key)
-                )''')
-
-    conn.commit()
-    conn.close()
-
-def log_access(license_key, ip):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO access_logs (license_key, ip_address, timestamp) VALUES (?, ?, ?)",
-        (license_key, ip, datetime.now().isoformat())
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS licenses (
+        license_key TEXT PRIMARY KEY,
+        hwid TEXT,
+        discord_id TEXT,
+        revoked BOOLEAN DEFAULT FALSE,
+        hwid_resets INTEGER DEFAULT 1,
+        created_at TIMESTAMP,
+        activated_at TIMESTAMP
     )
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS access_logs (
+        id SERIAL PRIMARY KEY,
+        license_key TEXT,
+        hwid TEXT,
+        ip_address TEXT,
+        timestamp TIMESTAMP
+    )
+    """)
+
     conn.commit()
     conn.close()
 
 init_db()
 
+def log_access(license_key, hwid, ip):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO access_logs (license_key, hwid, ip_address, timestamp)
+        VALUES (%s, %s, %s, %s)
+    """, (license_key, hwid, ip, datetime.utcnow()))
+    conn.commit()
+    conn.close()
+
 # ================================
-# PUBLIC ENDPOINTS (LAUNCHER)
+# HEALTH
 # ================================
 
-@app.route('/health', methods=['GET'])
+@app.route("/health")
 def health():
     return jsonify({"status": "online"}), 200
 
+# ================================
+# MC CLIENT — VALIDATE
+# ================================
 
-@app.route('/api/validate', methods=['POST'])
+@app.route("/api/validate", methods=["POST"])
 def validate():
-    """
-    Called by Launcher ONLY.
-    Expects JSON: { "license_key": str }
-    """
-
     data = request.json or {}
-    license_key = data.get('license_key', '').upper().strip()
+    license_key = data.get("license_key", "").upper().strip()
+    hwid = data.get("hwid", "").strip()
     ip = request.remote_addr
 
-    if not license_key:
-        return jsonify({"valid": False, "error": "Missing license_key"}), 400
+    if not license_key or not hwid:
+        return jsonify({"valid": False, "error": "Missing license_key or hwid"}), 400
 
     conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT * FROM licenses WHERE license_key = ?", (license_key,))
+    c = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+
+    c.execute("SELECT * FROM licenses WHERE license_key=%s", (license_key,))
     row = c.fetchone()
 
     if not row:
         conn.close()
         return jsonify({"valid": False, "error": "License not found"}), 404
 
-    if row['revoked']:
+    if row["revoked"]:
         conn.close()
         return jsonify({"valid": False, "error": "License revoked"}), 403
 
-    if not row['discord_id']:
+    if not row["discord_id"]:
         conn.close()
-        return jsonify({"valid": False, "error": "License not activated. Redeem in Discord first."}), 403
+        return jsonify({"valid": False, "error": "License not redeemed in Discord"}), 403
 
-    log_access(license_key, ip)
+    if not row["hwid"]:
+        c.execute("UPDATE licenses SET hwid=%s, activated_at=%s WHERE license_key=%s",
+                  (hwid, datetime.utcnow(), license_key))
+        conn.commit()
+        log_access(license_key, hwid, ip)
+        conn.close()
+        return jsonify({"valid": True, "message": "HWID bound"}), 200
+
+    if row["hwid"] == hwid:
+        log_access(license_key, hwid, ip)
+        conn.close()
+        return jsonify({"valid": True, "message": "License valid"}), 200
+
+    log_access(license_key, hwid, ip)
+    conn.close()
+    return jsonify({"valid": False, "error": "HWID mismatch"}), 403
+
+# ================================
+# DISCORD — REDEEM
+# ================================
+
+@app.route("/api/redeem", methods=["POST"])
+def redeem():
+    data = request.json or {}
+    license_key = data.get("license_key", "").upper().strip()
+    discord_id = data.get("discord_id", "").strip()
+
+    if not license_key or not discord_id:
+        return jsonify({"success": False, "error": "Missing data"}), 400
+
+    conn = get_db()
+    c = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+
+    c.execute("SELECT * FROM licenses WHERE license_key=%s", (license_key,))
+    row = c.fetchone()
+
+    if not row:
+        conn.close()
+        return jsonify({"success": False, "error": "License not found"}), 404
+
+    if row["revoked"]:
+        conn.close()
+        return jsonify({"success": False, "error": "License revoked"}), 403
+
+    if row["discord_id"]:
+        conn.close()
+        return jsonify({"success": False, "error": "License already redeemed"}), 403
+
+    c.execute("""
+        UPDATE licenses
+        SET discord_id=%s, activated_at=%s
+        WHERE license_key=%s
+    """, (discord_id, datetime.utcnow(), license_key))
+
+    conn.commit()
     conn.close()
 
-    return jsonify({"valid": True, "message": "License valid"}), 200
-
+    return jsonify({"success": True}), 200
 
 # ================================
-# ADMIN ENDPOINTS (DISCORD BOT)
+# ADMIN AUTH
 # ================================
 
-ADMIN_SECRET = os.getenv('ADMIN_SECRET', 'Qrynt10')
-
-def admin_auth(secret):
+def admin_ok(secret):
     return secret == ADMIN_SECRET
 
+# ================================
+# ADMIN — GENERATE
+# ================================
 
-@app.route('/api/generate', methods=['POST'])
+@app.route("/api/generate", methods=["POST"])
 def generate():
     data = request.json or {}
-    secret = data.get('admin_secret', '')
-    discord_id = data.get('discord_id', '')
+    secret = data.get("admin_secret", "")
+    discord_id = data.get("discord_id")
 
-    if not admin_auth(secret):
+    if not admin_ok(secret):
         return jsonify({"success": False, "error": "Unauthorized"}), 401
 
-    import secrets
     license_key = f"ASTRALUX-{secrets.token_hex(2).upper()}-{secrets.token_hex(2).upper()}-{secrets.token_hex(2).upper()}"
 
     conn = get_db()
     c = conn.cursor()
-    c.execute(
-        "INSERT INTO licenses (license_key, discord_id, created_at) VALUES (?, ?, ?)",
-        (license_key, discord_id if discord_id else None, datetime.now().isoformat())
-    )
+
+    c.execute("""
+        INSERT INTO licenses (license_key, discord_id, created_at)
+        VALUES (%s, %s, %s)
+    """, (license_key, discord_id, datetime.utcnow()))
+
     conn.commit()
     conn.close()
 
     return jsonify({"success": True, "license_key": license_key}), 200
 
+# ================================
+# ADMIN — REVOKE
+# ================================
 
-@app.route('/api/revoke', methods=['POST'])
+@app.route("/api/revoke", methods=["POST"])
 def revoke():
     data = request.json or {}
-    secret = data.get('admin_secret', '')
-    license_key = data.get('license_key', '').upper()
+    secret = data.get("admin_secret", "")
+    license_key = data.get("license_key", "").upper()
 
-    if not admin_auth(secret):
+    if not admin_ok(secret):
         return jsonify({"success": False, "error": "Unauthorized"}), 401
 
     conn = get_db()
     c = conn.cursor()
-    c.execute("UPDATE licenses SET revoked=1 WHERE license_key=?", (license_key,))
+    c.execute("UPDATE licenses SET revoked=TRUE WHERE license_key=%s", (license_key,))
     conn.commit()
     conn.close()
 
-    return jsonify({"success": True, "message": "License revoked"}), 200
-
+    return jsonify({"success": True}), 200
 
 # ================================
-# RUN SERVER
+# ADMIN — HWID RESET
 # ================================
 
-if __name__ == '__main__':
-    print("🚀 Astralux License API running (NO HWID)...")
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+@app.route("/api/hwid-reset", methods=["POST"])
+def hwid_reset():
+    data = request.json or {}
+    secret = data.get("admin_secret", "")
+    license_key = data.get("license_key", "").upper()
+
+    if not admin_ok(secret):
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+
+    conn = get_db()
+    c = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+
+    c.execute("SELECT hwid_resets FROM licenses WHERE license_key=%s", (license_key,))
+    row = c.fetchone()
+
+    if not row:
+        conn.close()
+        return jsonify({"success": False, "error": "License not found"}), 404
+
+    if row["hwid_resets"] <= 0:
+        conn.close()
+        return jsonify({"success": False, "error": "No resets left"}), 403
+
+    c.execute("""
+        UPDATE licenses SET hwid=NULL, hwid_resets=hwid_resets-1
+        WHERE license_key=%s
+    """, (license_key,))
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({"success": True}), 200
+
+# ================================
+# ADMIN — CHECK SHARE
+# ================================
+
+@app.route("/api/check-share", methods=["POST"])
+def check_share():
+    data = request.json or {}
+    secret = data.get("admin_secret", "")
+    license_key = data.get("license_key", "").upper()
+
+    if not admin_ok(secret):
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+
+    conn = get_db()
+    c = conn.cursor()
+
+    c.execute("""
+        SELECT DISTINCT hwid FROM access_logs WHERE license_key=%s
+    """, (license_key,))
+    hwids = [r[0] for r in c.fetchall() if r[0]]
+
+    c.execute("""
+        SELECT DISTINCT ip_address FROM access_logs WHERE license_key=%s
+    """, (license_key,))
+    ips = [r[0] for r in c.fetchall()]
+
+    conn.close()
+
+    return jsonify({
+        "success": True,
+        "unique_hwids": len(hwids),
+        "unique_ips": len(ips),
+        "hwids": hwids[:10],
+        "status": "🚨 SHARING" if len(hwids) > 1 else "✅ CLEAN"
+    }), 200
+
+# ================================
+# RUN
+# ================================
+
+if __name__ == "__main__":
+    print("🚀 Astralux API running (PostgreSQL)")
+    port = int(os.getenv("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
