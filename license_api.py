@@ -61,17 +61,12 @@ def health():
 
 @app.route('/api/validate', methods=['POST'])
 def validate():
-    """
-    Called by Minecraft client ONLY.
-    Expects JSON: { "license_key": str, "hwid": str }
-    """
     data = request.json
     license_key = data.get('license_key', '').upper().strip()
-    hwid = data.get('hwid', '').strip()
     ip = request.remote_addr
 
-    if not license_key or not hwid:
-        return jsonify({"valid": False, "error": "Missing license_key or hwid"}), 400
+    if not license_key:
+        return jsonify({"valid": False, "error": "Missing license_key"}), 400
 
     conn = get_db()
     c = conn.cursor()
@@ -86,27 +81,15 @@ def validate():
         conn.close()
         return jsonify({"valid": False, "error": "License revoked"}), 403
 
-    if not row['discord_id']:
-        conn.close()
-        return jsonify({"valid": False, "error": "License not activated. Redeem in Discord first."}), 403
+    # OPTIONAL: log access without HWID
+    c.execute(
+        "INSERT INTO access_logs (license_key, hwid, ip_address, timestamp) VALUES (?, ?, ?, ?)",
+        (license_key, None, ip, datetime.now().isoformat())
+    )
+    conn.commit()
+    conn.close()
 
-    stored_hwid = row['hwid']
-    if not stored_hwid:
-        c.execute("UPDATE licenses SET hwid=? WHERE license_key=?", (hwid, license_key))
-        conn.commit()
-        log_access(license_key, hwid, ip)
-        conn.close()
-        return jsonify({"valid": True, "message": "HWID bound successfully"}), 200
-
-    elif stored_hwid == hwid:
-        log_access(license_key, hwid, ip)
-        conn.close()
-        return jsonify({"valid": True, "message": "License valid"}), 200
-
-    else:
-        log_access(license_key, hwid, ip)
-        conn.close()
-        return jsonify({"valid": False, "error": "HWID mismatch. License bound to another PC."}), 403
+    return jsonify({"valid": True, "message": "License valid"}), 200
 
 # ================================
 # ADMIN ENDPOINTS (Discord Bot Only)
