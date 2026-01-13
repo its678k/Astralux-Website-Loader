@@ -5,7 +5,7 @@ from datetime import datetime
 import os
 
 app = Flask(__name__)
-CORS(app)  # Allow MC client requests
+CORS(app)
 
 DATABASE = 'licenses.db'
 
@@ -21,6 +21,8 @@ def get_db():
 def init_db():
     conn = get_db()
     c = conn.cursor()
+
+    # HWID columns kept but NOT USED (so no DB break)
     c.execute('''CREATE TABLE IF NOT EXISTS licenses (
                     license_key TEXT PRIMARY KEY,
                     hwid TEXT,
@@ -30,48 +32,52 @@ def init_db():
                     created_at TEXT,
                     activated_at TEXT
                 )''')
+
     c.execute('''CREATE TABLE IF NOT EXISTS access_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     license_key TEXT,
-                    hwid TEXT,
                     ip_address TEXT,
                     timestamp TEXT,
                     FOREIGN KEY (license_key) REFERENCES licenses(license_key)
                 )''')
+
     conn.commit()
     conn.close()
 
-def log_access(license_key, hwid, ip):
+def log_access(license_key, ip):
     conn = get_db()
     c = conn.cursor()
-    c.execute("INSERT INTO access_logs (license_key, hwid, ip_address, timestamp) VALUES (?, ?, ?, ?)",
-              (license_key, hwid, ip, datetime.now().isoformat()))
+    c.execute(
+        "INSERT INTO access_logs (license_key, ip_address, timestamp) VALUES (?, ?, ?)",
+        (license_key, ip, datetime.now().isoformat())
+    )
     conn.commit()
     conn.close()
 
 init_db()
 
 # ================================
-# PUBLIC ENDPOINTS (MC CLIENT)
+# PUBLIC ENDPOINTS (LAUNCHER)
 # ================================
 
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({"status": "online"}), 200
 
+
 @app.route('/api/validate', methods=['POST'])
 def validate():
     """
-    Called by Minecraft client ONLY.
-    Expects JSON: { "license_key": str, "hwid": str }
+    Called by Launcher ONLY.
+    Expects JSON: { "license_key": str }
     """
-    data = request.json
+
+    data = request.json or {}
     license_key = data.get('license_key', '').upper().strip()
-    hwid = data.get('hwid', '').strip()
     ip = request.remote_addr
 
-    if not license_key or not hwid:
-        return jsonify({"valid": False, "error": "Missing license_key or hwid"}), 400
+    if not license_key:
+        return jsonify({"valid": False, "error": "Missing license_key"}), 400
 
     conn = get_db()
     c = conn.cursor()
@@ -90,26 +96,14 @@ def validate():
         conn.close()
         return jsonify({"valid": False, "error": "License not activated. Redeem in Discord first."}), 403
 
-    stored_hwid = row['hwid']
-    if not stored_hwid:
-        c.execute("UPDATE licenses SET hwid=? WHERE license_key=?", (hwid, license_key))
-        conn.commit()
-        log_access(license_key, hwid, ip)
-        conn.close()
-        return jsonify({"valid": True, "message": "HWID bound successfully"}), 200
+    log_access(license_key, ip)
+    conn.close()
 
-    elif stored_hwid == hwid:
-        log_access(license_key, hwid, ip)
-        conn.close()
-        return jsonify({"valid": True, "message": "License valid"}), 200
+    return jsonify({"valid": True, "message": "License valid"}), 200
 
-    else:
-        log_access(license_key, hwid, ip)
-        conn.close()
-        return jsonify({"valid": False, "error": "HWID mismatch. License bound to another PC."}), 403
 
 # ================================
-# ADMIN ENDPOINTS (Discord Bot Only)
+# ADMIN ENDPOINTS (DISCORD BOT)
 # ================================
 
 ADMIN_SECRET = os.getenv('ADMIN_SECRET', 'Qrynt10')
@@ -117,9 +111,10 @@ ADMIN_SECRET = os.getenv('ADMIN_SECRET', 'Qrynt10')
 def admin_auth(secret):
     return secret == ADMIN_SECRET
 
+
 @app.route('/api/generate', methods=['POST'])
 def generate():
-    data = request.json
+    data = request.json or {}
     secret = data.get('admin_secret', '')
     discord_id = data.get('discord_id', '')
 
@@ -131,16 +126,19 @@ def generate():
 
     conn = get_db()
     c = conn.cursor()
-    c.execute("INSERT INTO licenses (license_key, discord_id, created_at) VALUES (?, ?, ?)",
-              (license_key, discord_id if discord_id else None, datetime.now().isoformat()))
+    c.execute(
+        "INSERT INTO licenses (license_key, discord_id, created_at) VALUES (?, ?, ?)",
+        (license_key, discord_id if discord_id else None, datetime.now().isoformat())
+    )
     conn.commit()
     conn.close()
 
     return jsonify({"success": True, "license_key": license_key}), 200
 
+
 @app.route('/api/revoke', methods=['POST'])
 def revoke():
-    data = request.json
+    data = request.json or {}
     secret = data.get('admin_secret', '')
     license_key = data.get('license_key', '').upper()
 
@@ -155,39 +153,12 @@ def revoke():
 
     return jsonify({"success": True, "message": "License revoked"}), 200
 
-@app.route('/api/hwid-reset', methods=['POST'])
-def hwid_reset():
-    data = request.json
-    secret = data.get('admin_secret', '')
-    license_key = data.get('license_key', '').upper()
-
-    if not admin_auth(secret):
-        return jsonify({"success": False, "error": "Unauthorized"}), 401
-
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT hwid_resets FROM licenses WHERE license_key=?", (license_key,))
-    row = c.fetchone()
-
-    if not row:
-        conn.close()
-        return jsonify({"success": False, "error": "License not found"}), 404
-
-    if row['hwid_resets'] <= 0:
-        conn.close()
-        return jsonify({"success": False, "error": "No HWID resets remaining"}), 403
-
-    c.execute("UPDATE licenses SET hwid=NULL, hwid_resets=hwid_resets-1 WHERE license_key=?", (license_key,))
-    conn.commit()
-    conn.close()
-
-    return jsonify({"success": True, "message": "HWID reset successfully"}), 200
 
 # ================================
 # RUN SERVER
 # ================================
 
 if __name__ == '__main__':
-    print("🚀 Astralux License API running...")
+    print("🚀 Astralux License API running (NO HWID)...")
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
