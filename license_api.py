@@ -91,6 +91,51 @@ def validate():
 
     return jsonify({"valid": True, "message": "License valid"}), 200
 
+@app.route('/api/redeem', methods=['POST'])
+def redeem():
+    """Activates a license by binding it to a HWID"""
+    data = request.json
+    license_key = data.get('license_key', '').upper().strip()
+    hwid = data.get('hwid', '').strip()
+    ip = request.remote_addr
+
+    if not license_key or not hwid:
+        return jsonify({"success": False, "error": "Missing license_key or hwid"}), 400
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT * FROM licenses WHERE license_key = ?", (license_key,))
+    row = c.fetchone()
+
+    if not row:
+        conn.close()
+        return jsonify({"success": False, "error": "License not found"}), 404
+
+    if row['revoked']:
+        conn.close()
+        return jsonify({"success": False, "error": "License revoked"}), 403
+
+    # If already bound to a HWID
+    if row['hwid']:
+        if row['hwid'] == hwid:
+            # Same HWID - allow access
+            log_access(license_key, hwid, ip)
+            conn.close()
+            return jsonify({"success": True, "message": "License validated"}), 200
+        else:
+            # Different HWID - deny
+            conn.close()
+            return jsonify({"success": False, "error": "HWID mismatch"}), 403
+
+    # First time activation - bind HWID
+    c.execute("UPDATE licenses SET hwid=?, activated_at=? WHERE license_key=?",
+              (hwid, datetime.now().isoformat(), license_key))
+    conn.commit()
+    log_access(license_key, hwid, ip)
+    conn.close()
+
+    return jsonify({"success": True, "message": "License activated"}), 200
+
 # ================================
 # ADMIN ENDPOINTS (Discord Bot Only)
 # ================================
